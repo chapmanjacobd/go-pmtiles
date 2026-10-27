@@ -271,7 +271,7 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 	}
 	defer bucket.Close()
 
-	r, err := bucket.NewRangeReader(ctx, key, 0, HeaderV3LenBytes)
+	r, etag, _, err := bucket.NewRangeReaderEtag(ctx, key, 0, HeaderV3LenBytes, "")
 
 	if err != nil {
 		return fmt.Errorf("Failed to create range reader for %s, %w", key, err)
@@ -445,9 +445,12 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 	reencoded, tileParts, tiledataLength, addressedTiles, tileContents := reencodeEntries(tileEntries)
 
 	overfetchRanges, totalBytes := mergeRanges(tileParts, overfetch)
+	transferredBytes := totalBytes
 
 	numOverfetchRanges := overfetchRanges.Len()
-	logger.Printf("fetching %d tiles, %d chunks, %d requests\n", len(reencoded), len(tileParts), overfetchRanges.Len())
+	if dryRun {
+		logger.Printf("fetching %d tiles, %d chunks, %d requests\n", len(reencoded), len(tileParts), numOverfetchRanges)
+	}
 
 	// TODO: takes up too much RAM
 	// construct the directories
@@ -482,17 +485,72 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 	}
 
 	if !dryRun {
+		totalOutputSize := uint64(HeaderV3LenBytes) + uint64(len(newRootBytes)) + header.MetadataLength + uint64(len(newLeavesBytes)) + totalActualBytes
+		resumePath := extractResumePath(output)
 
-		outfile, err := os.Create(output)
+		expectedResumeState := extractResumeState{
+			Version:          extractResumeVersion,
+			Bucket:           bucketURL,
+			Key:              key,
+			SourceETag:       etag,
+			SourceHeaderHash: extractSourceHeaderHash(b),
+			PlanHash:         extractPlanHash(headerBytes, newRootBytes, newLeavesBytes, tileParts),
+			OutputSize:       totalOutputSize,
+			TileDataLength:   tiledataLength,
+		}
+
+		var resumeState *extractResumeState
+		loadedResumeState, loadErr := loadExtractResume(resumePath)
+		if loadErr != nil {
+			logger.Printf("Ignoring unreadable resume state %s: %v\n", resumePath, loadErr)
+		} else if loadedResumeState != nil {
+			if loadedResumeState.matches(bucketURL, key, etag, expectedResumeState.SourceHeaderHash, expectedResumeState.PlanHash, totalOutputSize, tiledataLength) {
+				info, statErr := os.Stat(output)
+				if statErr == nil && uint64(info.Size()) == totalOutputSize {
+					resumeState = loadedResumeState
+				} else {
+					logger.Printf("Not resuming: output file %s is missing or has an unexpected size\n", output)
+				}
+			} else {
+				logger.Printf("Not resuming: resume state %s does not match this extract\n", resumePath)
+			}
+		}
+
+		flags := os.O_RDWR | os.O_CREATE
+		if resumeState == nil {
+			flags |= os.O_TRUNC
+			if err := removeExtractResumeFile(resumePath); err != nil {
+				return err
+			}
+		}
+
+		outfile, err := os.OpenFile(output, flags, 0644)
+		if err != nil {
+			return err
+		}
 		defer outfile.Close()
 
-		if err != nil {
+		if err := outfile.Truncate(int64(totalOutputSize)); err != nil {
+			return err
+		}
+
+		state := expectedResumeState
+		if resumeState != nil {
+			state.Completed = resumeState.Completed
+			logger.Printf("Resuming %s: %s of %s tile data already downloaded\n", output, humanize.Bytes(completedExtractResumeBytes(state.Completed)), humanize.Bytes(tiledataLength))
+		}
+
+		progress := newExtractResumeProgress(resumePath, state)
+		if err := progress.save(); err != nil {
 			return err
 		}
 
 		// set the file size and write empty space for the header for now
 		// see comment below
-		outfile.Truncate(HeaderV3LenBytes + int64(len(newRootBytes)) + int64(header.MetadataLength) + int64(len(newLeavesBytes)) + int64(totalActualBytes))
+		_, err = outfile.Seek(0, io.SeekStart)
+		if err != nil {
+			return err
+		}
 		_, err = outfile.Write(make([]byte, HeaderV3LenBytes))
 		if err != nil {
 			return err
@@ -526,11 +584,32 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 			return err
 		}
 
-		bar := defaultBytesProgressbar(
-			logger,
-			int64(totalBytes),
-			"fetching chunks",
-		)
+		// Drop bytes already written by a previous attempt
+		remainingRanges := list.New()
+		remainingBytes := uint64(0)
+		for e := overfetchRanges.Front(); e != nil; e = e.Next() {
+			for _, part := range overfetchRangeMissing(e.Value.(overfetchRange), progress.completedPrefix) {
+				remainingRanges.PushBack(part)
+				remainingBytes += part.Rng.Length
+			}
+		}
+		overfetchRanges = remainingRanges
+		numOverfetchRanges = overfetchRanges.Len()
+		transferredBytes = remainingBytes
+
+		logger.Printf("fetching %d tiles, %d chunks, %d requests\n", len(reencoded), len(tileParts), numOverfetchRanges)
+		if remainingBytes < totalBytes {
+			logger.Printf("Resumed %s of %s\n", humanize.Bytes(totalBytes-remainingBytes), humanize.Bytes(totalBytes))
+		}
+
+		var bar io.Writer = io.Discard
+		if remainingBytes > 0 {
+			bar = defaultBytesProgressbar(
+				logger,
+				int64(remainingBytes),
+				"fetching chunks",
+			)
+		}
 
 		var mu sync.Mutex
 
@@ -539,13 +618,30 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 			if err != nil {
 				return err
 			}
+			defer tileReader.Close()
 			offsetWriter := io.NewOffsetWriter(outfile, int64(header.TileDataOffset)+int64(or.Rng.DstOffset))
+			writer := io.MultiWriter(offsetWriter, bar)
+			dstOffset := or.Rng.DstOffset
 
 			for _, cd := range or.CopyDiscards {
+				remaining := cd.Wanted
+				for remaining > 0 {
+					chunk := remaining
+					if chunk > extractResumeCopyChunkSize {
+						chunk = extractResumeCopyChunkSize
+					}
 
-				_, err := io.CopyN(io.MultiWriter(offsetWriter, bar), tileReader, int64(cd.Wanted))
-				if err != nil {
-					return err
+					written, err := io.CopyN(writer, tileReader, int64(chunk))
+					if written > 0 {
+						if addErr := progress.add(dstOffset, uint64(written)); addErr != nil {
+							return addErr
+						}
+						dstOffset += uint64(written)
+						remaining -= uint64(written)
+					}
+					if err != nil {
+						return err
+					}
 				}
 
 				_, err = io.CopyN(bar, tileReader, int64(cd.Discard))
@@ -553,7 +649,6 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 					return err
 				}
 			}
-			tileReader.Close()
 			return nil
 		}
 
@@ -589,6 +684,15 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 
 		err = errs.Wait()
 		if err != nil {
+			if saveErr := progress.save(); saveErr != nil {
+				logger.Printf("Failed to save resume state, %v\n", saveErr)
+			}
+			return err
+		}
+
+		// Make sure all completed tile ranges are recorded before the header is
+		// written, so an interruption during the final write can still resume.
+		if err := progress.save(); err != nil {
 			return err
 		}
 
@@ -596,10 +700,22 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 		// otherwise a extract cancelled during the tile download section
 		// will appear valid with "pmtiles verify"
 		// even though the tile contents are corrupted.
-		outfile.Seek(0, io.SeekStart)
+		_, err = outfile.Seek(0, io.SeekStart)
+		if err != nil {
+			return err
+		}
 		_, err = outfile.Write(headerBytes)
 		if err != nil {
 			return err
+		}
+		if err := outfile.Sync(); err != nil {
+			return err
+		}
+		if err := outfile.Close(); err != nil {
+			return err
+		}
+		if err := progress.remove(); err != nil {
+			logger.Printf("Failed to remove resume state %s, %v\n", resumePath, err)
 		}
 	}
 
@@ -609,7 +725,7 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 	totalRequests++                     // metadata
 	totalRequests += numOverfetchRanges
 	logger.Printf("Extract required %d total requests.\n", totalRequests)
-	logger.Printf("Extract transferred %s (overfetch %v) for an archive size of %s\n", humanize.Bytes(totalBytes), overfetch, humanize.Bytes(totalActualBytes))
+	logger.Printf("Extract transferred %s (overfetch %v) for an archive size of %s\n", humanize.Bytes(transferredBytes), overfetch, humanize.Bytes(totalActualBytes))
 
 	return nil
 }
