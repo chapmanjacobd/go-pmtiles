@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -43,6 +45,19 @@ type RefreshRequiredError struct {
 func (m *RefreshRequiredError) Error() string {
 	return fmt.Sprintf("HTTP error indicates file has changed: %d", m.StatusCode)
 }
+
+// HTTPStatusError is an unexpected HTTP status in reply to a range request.
+type HTTPStatusError struct {
+	StatusCode int
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("HTTP error: %d", e.StatusCode)
+}
+
+// ErrRangeNotHonored means the server did not return exactly the requested
+// byte range (e.g. a 200 with the whole file), so the bytes cannot be trusted.
+var ErrRangeNotHonored = errors.New("server did not return the requested byte range")
 
 type mockBucket struct {
 	items map[string][]byte
@@ -165,6 +180,97 @@ type HTTPBucket struct {
 	client  HTTPClient
 }
 
+// newDownloadClient returns an HTTP client for bulk range downloads.
+// http.DefaultClient keeps only 2 idle connections per host, so with more
+// download threads every extra request opens a new TCP+TLS connection.
+// HTTP/2 is disabled because it multiplexes all requests to a host over a
+// single TCP connection, which caps parallel range downloads at the
+// throughput of that one connection.
+func newDownloadClient(connections int) *http.Client {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	// same settings as http.DefaultTransport, except the protocols and idle connections
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           idleTimeoutDialer(15*time.Second, downloadIdleTimeout),
+		Protocols:             protocols,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   max(connections, 2),
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &http.Client{Transport: transport}
+}
+
+// downloadIdleTimeout aborts a download connection that receives no bytes for
+// this long, so a stalled request is retried (aria2's --timeout).
+const downloadIdleTimeout = 60 * time.Second
+
+// idleTimeoutConn fails a Read that gets no data within timeout.
+type idleTimeoutConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *idleTimeoutConn) Read(p []byte) (int, error) {
+	if err := c.Conn.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(p)
+}
+
+func idleTimeoutDialer(connectTimeout time.Duration, idleTimeout time.Duration) func(context.Context, string, string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &idleTimeoutConn{conn, idleTimeout}, nil
+	}
+}
+
+// strictRangeClient rejects any response to a range request that is not
+// exactly the requested range, which would otherwise silently corrupt data.
+type strictRangeClient struct {
+	HTTPClient
+}
+
+func (c strictRangeClient) Do(req *http.Request) (*http.Response, error) {
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil || (resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent) {
+		return resp, err
+	}
+	var first, last int64
+	if _, err := fmt.Sscanf(req.Header.Get("Range"), "bytes=%d-%d", &first, &last); err != nil {
+		return resp, nil
+	}
+	if err := checkContentRange(resp, first, last-first+1); err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	return resp, nil
+}
+
+// checkContentRange verifies that a response carries exactly the bytes
+// [offset, offset+length) that were requested.
+func checkContentRange(resp *http.Response, offset int64, length int64) error {
+	if resp.StatusCode == http.StatusOK {
+		// a 200 is only the requested range when that range is the whole file
+		if offset == 0 && resp.ContentLength == length {
+			return nil
+		}
+		return fmt.Errorf("%w: got 200 for bytes %d-%d", ErrRangeNotHonored, offset, offset+length-1)
+	}
+	var first, last int64
+	contentRange := resp.Header.Get("Content-Range")
+	if _, err := fmt.Sscanf(contentRange, "bytes %d-%d/", &first, &last); err != nil || first != offset || last != offset+length-1 {
+		return fmt.Errorf("%w: asked for bytes %d-%d, got Content-Range %q", ErrRangeNotHonored, offset, offset+length-1, contentRange)
+	}
+	return nil
+}
+
 func (b HTTPBucket) NewRangeReader(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
 	body, _, _, err := b.NewRangeReaderEtag(ctx, key, offset, length, "")
 	return body, err
@@ -197,7 +303,7 @@ func (b HTTPBucket) NewRangeReaderEtag(ctx context.Context, key string, offset, 
 		if isRefreshRequiredCode(resp.StatusCode) {
 			err = &RefreshRequiredError{resp.StatusCode}
 		} else {
-			err = fmt.Errorf("HTTP error: %d", resp.StatusCode)
+			err = &HTTPStatusError{resp.StatusCode}
 		}
 		return nil, "", resp.StatusCode, err
 	}
