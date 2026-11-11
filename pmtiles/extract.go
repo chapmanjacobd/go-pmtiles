@@ -804,8 +804,18 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 		data, _ := json.Marshal(map[string]uint64{"transfer_bytes": totalBytes, "archive_bytes": totalOutputSize, "requests": uint64(numOverfetchRanges)})
 		progressJSON.Write(append(data, '\n'))
 	}
+	progress.setArchiveBytes(totalOutputSize)
 
 	if !dryRun {
+
+		// 9. get the metadata (written below). It is fetched before the output
+		// is opened: an output that already holds this extract is recognized by
+		// all its bytes before the tile data, and a failed fetch leaves an
+		// existing output untouched.
+		metadataBytes, _, err := fetchRange(ctx, bucket, key, sourceMetadataOffset, header.MetadataLength, pinnedETag, defaultRetryPolicy, onRetry)
+		if err != nil {
+			return err
+		}
 
 		// resume a previous run of this same extract, or start over
 		journalPath := extractJournalPath(output)
@@ -832,6 +842,22 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 			} else {
 				state.Completed = previous.Completed
 				resuming = true
+			}
+		} else {
+			// No journal: a previous run may have finished this same extract
+			// (the journal is removed on success). Then there is nothing to do.
+			prefix := make([]byte, 0, len(headerBytes)+len(newRootBytes)+len(metadataBytes)+len(newLeavesBytes))
+			prefix = append(prefix, headerBytes...)
+			prefix = append(prefix, newRootBytes...)
+			prefix = append(prefix, metadataBytes...)
+			prefix = append(prefix, newLeavesBytes...)
+			complete, checkErr := outputComplete(output, totalOutputSize, prefix)
+			if checkErr != nil {
+				logger.Printf("Not skipping: cannot check %s: %v\n", output, checkErr)
+			} else if complete {
+				logger.Printf("%s is already complete (%s); nothing to download\n", output, humanize.Bytes(totalOutputSize))
+				progress.markComplete(totalBytes)
+				return nil
 			}
 		}
 
@@ -869,12 +895,7 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 			return err
 		}
 
-		// 9. get and write the metadata
-		metadataBytes, _, err := fetchRange(ctx, bucket, key, sourceMetadataOffset, header.MetadataLength, pinnedETag, defaultRetryPolicy, onRetry)
-		if err != nil {
-			return err
-		}
-
+		// 9. write the metadata
 		_, err = outfile.Write(metadataBytes)
 		if err != nil {
 			return err

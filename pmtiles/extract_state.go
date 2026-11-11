@@ -9,6 +9,7 @@ package pmtiles
 // (github.com/chapmanjacobd/go-pmtiles, branch resume).
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -229,6 +230,40 @@ func extractJournalPath(output string) string {
 	return output + ".resume"
 }
 
+// outputComplete reports whether path already holds the finished extract: it has
+// the planned size and starts with the planned prefix (header, root directory,
+// metadata and leaf directories). Extract writes the header last, after all tile
+// data and before it removes the journal, so a partial output never matches. On
+// a match the file is synced, because an older pmtiles did not sync its output.
+func outputComplete(path string, size uint64, prefix []byte) (bool, error) {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || uint64(info.Size()) != size || uint64(len(prefix)) > size {
+		return false, nil
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	got := make([]byte, len(prefix))
+	if _, err := f.ReadAt(got, 0); err != nil {
+		return false, err
+	}
+	if !bytes.Equal(got, prefix) {
+		return false, nil
+	}
+	if err := f.Sync(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func sha256Hex(chunks ...[]byte) string {
 	h := sha256.New()
 	var length [8]byte
@@ -381,6 +416,9 @@ type extractProgress struct {
 	requestsTotal func() int64
 	retries       atomic.Int64
 
+	archiveBytes    atomic.Uint64
+	alreadyComplete atomic.Bool
+
 	stop chan struct{}
 	done chan struct{}
 }
@@ -400,6 +438,11 @@ type progressLine struct {
 	RequestsDone  int64    `json:"requests_done"`
 	RequestsTotal int64    `json:"requests_total"`
 	Retries       int64    `json:"retries"`
+	// ArchiveBytes is the size of the output archive, once the plan is known.
+	ArchiveBytes uint64 `json:"archive_bytes,omitempty"`
+	// AlreadyComplete is set only when the output already held this complete
+	// extract, so nothing was downloaded (see markComplete).
+	AlreadyComplete bool `json:"already_complete,omitempty"`
 	// ExitCode is set only on the terminal line (see finishOutcome): it names the
 	// process exit code so a consumer that reads stdout alone knows the outcome.
 	ExitCode *int `json:"exit_code,omitempty"`
@@ -455,6 +498,28 @@ func (p *extractProgress) startDownload(bytesTotal uint64, resumedBytes uint64, 
 	p.setPhase("download")
 }
 
+// setArchiveBytes records the size of the output archive, known after the plan.
+func (p *extractProgress) setArchiveBytes(n uint64) {
+	if p != nil {
+		p.archiveBytes.Store(n)
+	}
+}
+
+// markComplete reports an output that already held this complete extract: the
+// whole planned transfer counts as done by an earlier run, and no requests are
+// left. The terminal line (finishOutcome) then says done with already_complete.
+func (p *extractProgress) markComplete(bytesTotal uint64) {
+	if p == nil {
+		return
+	}
+	p.bytesTotal.Store(bytesTotal)
+	p.resumedBytes.Store(bytesTotal)
+	p.alreadyComplete.Store(true)
+	p.mu.Lock()
+	p.requestsTotal = func() int64 { return 0 }
+	p.mu.Unlock()
+}
+
 func (p *extractProgress) addTransferred(n uint64) {
 	if p != nil {
 		p.transferred.Add(n)
@@ -491,6 +556,9 @@ func (p *extractProgress) emit() {
 		ResumedBytes: p.resumedBytes.Load(),
 		RequestsDone: p.requestsDone.Load(),
 		Retries:      p.retries.Load(),
+
+		ArchiveBytes:    p.archiveBytes.Load(),
+		AlreadyComplete: p.alreadyComplete.Load(),
 	}
 	line.BytesDone = min(line.ResumedBytes+transferred, line.BytesTotal)
 	if p.requestsTotal != nil {

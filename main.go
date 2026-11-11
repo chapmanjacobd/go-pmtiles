@@ -74,7 +74,7 @@ var cli struct {
 		DryRun          bool    `help:"Calculate tiles to extract, but don't download them"`
 		Progress        string  `default:"bar" enum:"bar,json" help:"Progress output: bar, or json (one JSON line per second on stdout; logs go to stderr)"`
 		Overfetch       float32 `default:"0.05" help:"What ratio of extra data to download to minimize # requests; 0.2 is 20%"`
-	} `cmd:"" help:"Create an archive from a larger archive for a subset of zoom levels or geographic region"`
+	} `cmd:"" help:"Create an archive from a larger archive for a subset of zoom levels or geographic region. Run the same command again to resume an interrupted download; when the output already holds the complete extract, nothing is downloaded. Exit codes: 0 done (also when already complete), 1 error, 2 network gave up (run again to resume), 3 paused by SIGINT/SIGTERM (run again to resume), 4 source changed (start over)."`
 
 	Merge struct {
 		Archives []string `arg:"" name:"inputs_then_output" help:"One or more disjoint input archives, followed by the output filename."`
